@@ -1,4 +1,4 @@
-# Otimizador de Posicionamento e Pré-Roteamento de PCBs com Algoritmo Genético no KiCad
+# Otimizador de Posicionamento e Roteamento de PCBs com Algoritmo Genético no KiCad
 
 Este repositório contém uma solução automatizada desenvolvida em Python para otimização do posicionamento (*placement*) e roteamento de componentes em Placas de Circuito Impresso (PCBs). Utilizando **Algoritmos Genéticos (AG)** integrados à API nativa do **KiCad (`pcbnew`)**, o projeto visa atender a regras de negócio e boas práticas de projeto eletrônico, garantindo menor distância entre componentes críticos e prevenindo colisões físicas.
 

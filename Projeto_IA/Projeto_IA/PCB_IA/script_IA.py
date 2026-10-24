@@ -5,15 +5,19 @@ import pcbnew
 
 @dataclass
 class BoardRules:
-    mcu_ref: str            # ex: "U1"
     crystal_ref: str        # ex: "Y1"
-    decoupling_refs: list   # ex: ["C1", "C2", "C3", "C4"]
-    movable_refs: list      # ex: ["Y1", "C1", "C2", "C3", "C4"]
+    crystal_target: str     # ex: "U1" (chip ao qual o cristal está associado)
+    decoupling_map: dict    # ex: {"C1": "U1", "C2": "U2"} -> Capacitor C1 perto de U1, C2 perto de U2, etc.
+    movable_refs: list      # Lista de todos os componentes que a IA vai mover
 
+# Definição modular e escalável: adicione quantos quiser aqui no futuro!
 BOARD_RULES = BoardRules(
-    mcu_ref="U1",
     crystal_ref="Y1",
-    decoupling_refs=["C1", "C2"],
+    crystal_target="U1",
+    decoupling_map={
+        "C1": "U1",  # C1 deve ficar próximo do microcontrolador U1
+        "C2": "U2"   # C2 deve ficar próximo do acelerômetro U2 (ou outro chip)
+    },
     movable_refs=["Y1", "C1", "C2"]
 )
 
@@ -47,7 +51,7 @@ def check_box_overlap(pos1, size1, pos2, size2, clearance_mm=0.2):
     
     return 0.0
 
-def evaluate_fitness(individual, mcu_pos, mcu_size, fixed_fps_data, movable_sizes, board_bounds, rules):
+def evaluate_fitness(individual, all_fps_pos, all_fps_sizes, board_bounds, rules):
     total_fitness = 0.0
     
     current_positions = {}
@@ -55,46 +59,45 @@ def evaluate_fitness(individual, mcu_pos, mcu_size, fixed_fps_data, movable_size
     
     xmin_board, xmax_board, ymin_board, ymax_board = board_bounds
     
+    # Atualiza as posições dos componentes móveis propostas pelo indivíduo atual
     for ref in rules.movable_refs:
         if ref in individual:
             x, y, _ = individual[ref]
             current_positions[ref] = (x, y)
-            w, h = movable_sizes[ref]
+            w, h = all_fps_sizes[ref]
             current_sizes[ref] = (w, h)
 
-            # 0. Restrição de Borda: Se o componente sair da área da placa, penalidade severa
+            # 0. Restrição de Borda: Se o componente móvel sair da placa, penalidade severa
             half_w, half_h = w / 2.0, h / 2.0
             if (x - half_w < xmin_board) or (x + half_w > xmax_board) or \
                (y - half_h < ymin_board) or (y + half_h > ymax_board):
                 total_fitness -= 50000.0
 
-    # 1. Colisão entre os próprios componentes móveis
-    movable_keys = list(current_positions.keys())
-    for i in range(len(movable_keys)):
-        for j in range(i + 1, len(movable_keys)):
-            r1, r2 = movable_keys[i], movable_keys[j]
-            overlap = check_box_overlap(current_positions[r1], current_sizes[r1], 
-                                         current_positions[r2], current_sizes[r2], clearance_mm=0.3)
+    # Combina posições e tamanhos de todos os componentes (fixos + móveis correntes)
+    combined_positions = dict(all_fps_pos)
+    for ref, pos in current_positions.items():
+        combined_positions[ref] = pos
+
+    combined_sizes = dict(all_fps_sizes)
+    for ref, size in current_sizes.items():
+        combined_sizes[ref] = size
+
+    # 1. Colisão entre todos os componentes da placa (móveis entre si e contra fixos)
+    refs_list = list(combined_positions.keys())
+    for i in range(len(refs_list)):
+        for j in range(i + 1, len(refs_list)):
+            r1, r2 = refs_list[i], refs_list[j]
+            overlap = check_box_overlap(combined_positions[r1], combined_sizes[r1], 
+                                         combined_positions[r2], combined_sizes[r2], clearance_mm=0.3)
             if overlap > 0.0:
-                total_fitness -= 20000.0 * (overlap + 1.0)
+                # Penalidade pesada por colisão
+                total_fitness -= 30000.0 * (overlap + 1.0)
 
-    # 2. Colisão contra o MCU e componentes fixos ao redor
-    for mov_ref, mov_pos in current_positions.items():
-        mov_size = current_sizes[mov_ref]
-        
-        overlap_mcu = check_box_overlap(mov_pos, mov_size, mcu_pos, mcu_size, clearance_mm=0.3)
-        if overlap_mcu > 0.0:
-            total_fitness -= 25000.0 * (overlap_mcu + 1.0)
-
-        for fixed_ref, (fix_pos, fix_size) in fixed_fps_data.items():
-            overlap_fixed = check_box_overlap(mov_pos, mov_size, fix_pos, fix_size, clearance_mm=0.3)
-            if overlap_fixed > 0.0:
-                total_fitness -= 25000.0 * (overlap_fixed + 1.0)
-
-    # 3. Avaliação do Cristal (Y1): próximo do MCU, respeitando o limite seguro de ruído
-    if rules.crystal_ref in individual:
+    # 2. Avaliação do Cristal (deve ficar próximo ao seu chip alvo, respeitando zona de segurança contra ruído)
+    if rules.crystal_ref in individual and rules.crystal_target in all_fps_pos:
         crystal_x, crystal_y, _ = individual[rules.crystal_ref]
-        dist_crystal = math.hypot(mcu_pos[0] - crystal_x, mcu_pos[1] - crystal_y)
+        target_pos = all_fps_pos[rules.crystal_target]
+        dist_crystal = math.hypot(target_pos[0] - crystal_x, target_pos[1] - crystal_y)
         MIN_SAFE_DISTANCE_MM = 7.5  
         
         if dist_crystal < MIN_SAFE_DISTANCE_MM:
@@ -102,17 +105,18 @@ def evaluate_fitness(individual, mcu_pos, mcu_size, fixed_fps_data, movable_size
         else:
             total_fitness += -dist_crystal * 1.2
 
-    # 4. Avaliação dos Capacitores de Desacoplamento: o mais perto possível do MCU
-    for cap_ref in rules.decoupling_refs:
-        if cap_ref in individual:
+    # 3. Avaliação Escalável dos Capacitores de Desacoplamento (cada um atrelado ao seu respectivo chip alvo)
+    for cap_ref, target_ref in rules.decoupling_map.items():
+        if cap_ref in individual and target_ref in all_fps_pos:
             cap_x, cap_y, _ = individual[cap_ref]
-            dist_cap = math.hypot(mcu_pos[0] - cap_x, mcu_pos[1] - cap_y)
-            MAX_DECOUP_DIST_MM = 3.5  
+            target_pos = all_fps_pos[target_ref]
+            dist_cap = math.hypot(target_pos[0] - cap_x, target_pos[1] - cap_y)
+            MAX_DECOUP_DIST_MM = 3.5  # Boa prática: bem próximo ao pino de alimentação do chip correspondente
             
             if dist_cap > MAX_DECOUP_DIST_MM:
                 total_fitness += -800.0 * (dist_cap - MAX_DECOUP_DIST_MM) - 300.0
             else:
-                total_fitness += -dist_cap * 0.5
+                total_fitness += -dist_cap * 0.5  # Recompensa por estar colado ao chip alvo
 
     return total_fitness
 
@@ -152,13 +156,18 @@ def run_ga_placement(board, pop_size=70, generations=100):
     rules = BOARD_RULES
     fps = {fp.GetReference(): fp for fp in board.GetFootprints()}
 
-    all_refs_to_check = [rules.mcu_ref, rules.crystal_ref] + rules.decoupling_refs
-    missing = [ref for ref in all_refs_to_check if ref not in fps]
+    # Valida se todos os componentes configurados nas regras existem na PCB
+    required_refs = [rules.crystal_ref, rules.crystal_target] + list(rules.decoupling_map.keys()) + list(rules.decoupling_map.values())
+    missing = [ref for ref in set(required_refs) if ref not in fps]
     if missing:
-        print(f"[ERRO] Componentes não encontrados na PCB: {missing}")
+        print(f"[ERRO] Componentes obrigatórios não encontrados na PCB: {missing}")
         return
 
-    # Utiliza ComputeBoundingBox() para mapear os limites da placa com segurança
+    # Mapeia posições e tamanhos de TODOS os footprints da placa
+    all_fps_pos = {ref: (pcbnew.ToMM(fp.GetPosition().x), pcbnew.ToMM(fp.GetPosition().y)) for ref, fp in fps.items()}
+    all_fps_sizes = {ref: get_approx_dimensions(fp) for ref, fp in fps.items()}
+
+    # Limites físicos da placa
     board_bbox = board.ComputeBoundingBox(True)
     board_bounds = (
         pcbnew.ToMM(board_bbox.GetX()),
@@ -168,26 +177,13 @@ def run_ga_placement(board, pop_size=70, generations=100):
     )
     print(f"[INFO] Limites da placa detectados: X({board_bounds[0]:.1f} a {board_bounds[1]:.1f}mm), Y({board_bounds[2]:.1f} a {board_bounds[3]:.1f}mm)")
 
-    mcu_fp = fps[rules.mcu_ref]
-    mcu_pos = (pcbnew.ToMM(mcu_fp.GetPosition().x), pcbnew.ToMM(mcu_fp.GetPosition().y))
-    mcu_size = get_approx_dimensions(mcu_fp)
-
-    ignored_refs = set(rules.movable_refs) | {rules.mcu_ref}
-    fixed_fps_data = {}
-    for ref, fp in fps.items():
-        if ref not in ignored_refs:
-            pos = (pcbnew.ToMM(fp.GetPosition().x), pcbnew.ToMM(fp.GetPosition().y))
-            size = get_approx_dimensions(fp)
-            fixed_fps_data[ref] = (pos, size)
-
-    movable_sizes = {ref: get_approx_dimensions(fps[ref]) for ref in rules.movable_refs}
-
-    # Restringe a área de busca inicial estritamente dentro da placa e ao redor do MCU
+    # Define a área de busca baseada na posição do chip principal (crystal_target) ou centro geral
+    target_pos = all_fps_pos[rules.crystal_target]
     search_bounds = (
-        max(board_bounds[0] + 2.0, mcu_pos[0] - 15.0),
-        min(board_bounds[1] - 2.0, mcu_pos[0] + 15.0),
-        max(board_bounds[2] + 2.0, mcu_pos[1] - 15.0),
-        min(board_bounds[3] - 2.0, mcu_pos[1] + 15.0)
+        max(board_bounds[0] + 2.0, target_pos[0] - 20.0),
+        min(board_bounds[1] - 2.0, target_pos[0] + 20.0),
+        max(board_bounds[2] + 2.0, target_pos[1] - 20.0),
+        min(board_bounds[3] - 2.0, target_pos[1] + 20.0)
     )
 
     population = [create_individual(rules, search_bounds) for _ in range(pop_size)]
@@ -195,7 +191,7 @@ def run_ga_placement(board, pop_size=70, generations=100):
     best_fitness = -float('inf')
 
     for gen in range(generations):
-        fitnesses = [evaluate_fitness(ind, mcu_pos, mcu_size, fixed_fps_data, movable_sizes, board_bounds, rules) for ind in population]
+        fitnesses = [evaluate_fitness(ind, all_fps_pos, all_fps_sizes, board_bounds, rules) for ind in population]
 
         for ind, fit in zip(population, fitnesses):
             if fit > best_fitness:
@@ -218,7 +214,7 @@ def run_ga_placement(board, pop_size=70, generations=100):
 
         population = next_population
 
-    # Aplica as posições finais na PCB
+    # Aplica as posições finais otimizadas na PCB
     for ref in rules.movable_refs:
         fp = fps[ref]
         best_x, best_y, best_ori = best_individual[ref]
@@ -227,11 +223,10 @@ def run_ga_placement(board, pop_size=70, generations=100):
 
     pcbnew.Refresh()
     
-    print(f"\n[SUCESSO] Otimização concluída respeitando limites da placa e sem colisões!")
+    print(f"\n[SUCESSO] Otimização escalável concluída com sucesso!")
     for ref in rules.movable_refs:
         best_x, best_y, _ = best_individual[ref]
-        dist_final = math.hypot(mcu_pos[0] - best_x, mcu_pos[1] - best_y)
-        print(f"- {ref} posicionado em X:{best_x:.2f}mm, Y:{best_y:.2f}mm (Distância ao MCU: {dist_final:.2f} mm)")
+        print(f"- {ref} posicionado em X:{best_x:.2f}mm, Y:{best_y:.2f}mm")
 
 if __name__ == "__main__":
     board = pcbnew.GetBoard()

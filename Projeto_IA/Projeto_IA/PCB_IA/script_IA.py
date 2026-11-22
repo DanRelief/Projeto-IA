@@ -1,23 +1,13 @@
-# *****************************************************************************
-# OTIMIZADOR DE POSICIONAMENTO DE PCB COM ALGORITMO GENÉTICO (KiCad / pcbnew)
-# *****************************************************************************
-#
-# Visão Geral do Funcionamento:
-#   Este script utiliza um Algoritmo Genético (AG) aliado a uma busca local
-#   (Descida por Coordenadas) para posicionar automaticamente componentes SMD/THT
-#   em uma placa de circuito impresso dentro do KiCad.
-#
-# Garantias Físicas e Elétricas:
-#   * Zero sobreposição: nenhum componente móvel invade o corpo de outro (móvel
-#     ou fixo), respeitando uma folga mínima (clearance_mm) para soldagem.
-#   * Respeito aos limites: todos os componentes permanecem dentro do contorno
-#     da placa (Edge.Cuts) com margem de segurança (edge_margin_mm).
-#   * Atração baseada em pinos reais: as distâncias são calculadas diretamente
-#     entre os pads conectados pelas NETS da PCB (ex.: Y1 aos pinos do cristal
-#     do U1), usando FALLBACK_MAP apenas se a net não existir.
-#   * Limpeza de serigrafia: oculta valores poluídos e organiza designadores
-#     (Reference) na camada F.Silkscreen sem colisões.
-# ****************************************************************************
+# Otimizador de posicionamento de PCB com Algoritmo Genético (KiCad / pcbnew)
+
+# Principais garantias desta versão:
+#   * Nenhum componente móvel entra em outro componente (móvel ou fixo), com folga mínima.
+#   * Nenhum componente móvel sai do contorno da placa (Edge.Cuts), com margem de borda.
+#   * Se o AG não achar uma solução 100% válida, NADA é movido na placa.
+#   * A atração (distância) é calculada a partir dos PINOS reais, descobertos pelas NETS
+#     da própria PCB (ex.: Y1 -> pinos 52/53 do U1; C2 -> VDD do U2). O mapa manual
+#     (FALLBACK_MAP) só é usado se a net não for encontrada.
+#   * Limpeza de cobre antigo, organização automática da serigrafia e salvamento da placa.
 
 import math
 import random
@@ -26,23 +16,16 @@ from dataclasses import dataclass, field
 import pcbnew
 
 
-
-# ============================================================================
-# REGRAS DA PLACA E PARÂMETROS DE ENGENHARIA (BOARD_RULES)
-# ============================================================================
-# Define quais componentes são fixos (âncoras), quais podem ser movidos pelo AG,
-# as restrições mecânicas de fabricação e os pesos elétricos de cada circuito.
-
 @dataclass
 class BoardRules:
     movable_refs: list                  # componentes que o AG pode mover
-    anchor_refs: list                  # Componentes fixos (CIs, conectores grandes, chaves) usados como referência
+    anchor_refs: list                   # CIs de referência (fixos) para as nets
     fallback_map: dict                  # {ref: [(CI, pino), ...]} usado se não houver net
-    ignore_net_keywords: tuple = ("GND",)   # Redes ignoradas no cálculo de distância (plano GND cobre toda a placa)
-    clearance_mm: float = 0.25          # Folga mínima (mm) entre componentes
-    edge_margin_mm: float = 1.20        # folga mínima até a borda da placa
-    default_weight: float = 10.0        # Peso padrão de atração quando não especificado em 'weights'
-    weights: dict = field(default_factory=dict)  # Pesos individuais (quanto maior, mais curto o caminho)
+    ignore_net_keywords: tuple = ("GND",)   # nets ignoradas (terra não "atrai")
+    clearance_mm: float = 0.25          # folga mínima entre corpos
+    edge_margin_mm: float = 0.30        # folga mínima até a borda da placa
+    default_weight: float = 10.0        # peso padrão da distância
+    weights: dict = field(default_factory=dict)  # peso por referência
     init_radius_mm: float = 5.0         # raio da população inicial ao redor do pino-alvo
     # Restringe a quais âncoras cada componente é atraído (só nets compartilhadas com elas contam).
     # Quem não estiver aqui é atraído por todas as âncoras.
@@ -55,86 +38,40 @@ class BoardRules:
 
 
 BOARD_RULES = BoardRules(
-    movable_refs=[
-        "Y1", "Y2", "F1",           
-        "C1", "C2", "C3", "C4",   
-        "R1", "R2", "R3", "R4",
-        "L1", "L2", "L3", "J1"
-    ],
+    movable_refs=["Y1", "Y2", "F1", "C1", "C2", "C3", "R2", "R3", "L1", "L2",
+                  "R4", "L3", "C4", "J1"],
     anchor_refs=["U1", "U2", "BT2", "SW1", "SW2"],
-    group_nets=(
-        "/ANT_SIG",             # Linha de sinal de RF entre U1, C4 e R4
-        "Net-(J1-In)",          # Saída da rede de casamento (R4, L3) para o conector coaxial J1
-        "/ACC_CLK_EXT",         # Clock externo entre oscilador Y2, R1 e acelerômetro U2
-        "Net-(L1-Pad1)",        # Filtro de alimentação entre R2 e L1
-        "Net-(L2-Pad1)",        # Filtro de alimentação entre R3 e L2
-    ),
-
-    clearance_mm=0.35,      # 0.35 mm garante espaço seguro para soldagem manual/reflow sem curto    
-    edge_margin_mm=1.50,       # 1.50 mm protege componentes contra fresagem e anel de GND na borda
-    group_weight=28.0,          # Alta coesão para manter redes de RF e filtros compactos
-    edge_weights={"J1": 4.0},   # Leve preferência para manter o conector coaxial J1 perto da borda
-
-
-    # Direcionamento de atração: evita que um capacitor de um CI seja puxado por outro CI
+    group_nets=("/ANT_SIG", "ANT_SIG"),  # Ajuste se a net na PCB tiver ou não a barra "/"
+    group_weight=12.0,
+    edge_weights={"J1": 30.0, "R4": 5.0, "L3": 5.0, "C4": 5.0},
     attract_to={
-        # --- U1 (Microcontrolador / RF) ---
-        "C1": ["U1"], "C2": ["U1"], "C3": ["U1"],
-        "C4": ["U1"], "R4": ["U1"], "L3": ["U1"],
-        "L1": ["U1"], "L2": ["U1"],
-
-        # --- U2 (Acelerômetro) ---
-        "R1": ["U2"], "Y2": ["U2"],
-
-        # --- BT2 (Entrada de Bateria e Proteção) ---
-        "F1": ["BT2"],
-        "R2": ["BT2"], "R3": ["BT2"],
+        "R4": ["U1"], "L3": ["U1"], "C4": ["U1"], "J1": ["U1"],   # antena -> ESP32-S2
+        "Y1": ["U1"],     # cristal do micro  -> ESP32-S2
+        "Y2": ["U2"],     # oscilador externo -> acelerômetro
+        "F1": ["BT2"],    # fusível           -> conector da bateria
+        "C1": ["U1"], "C3": ["U1"], "L1": ["U1"], "L2": ["U1"],   # desacoplamento do micro
+        "R2": ["U1"], "R3": ["U1"],                                # (R2/R3 fazem parte do desacoplamento)
+        "C2": ["U2"],     # desacoplamento do acelerômetro
     },
-
-
+    # Usado só se a net não for encontrada na PCB (confira a numeração dos seus footprints):
     fallback_map={
-        "F1": [("BT2", "1")],       # Garante fusível F1 colado ao polo positivo (+) da bateria
-        "Y2": [("U2", "13")],       #Cristal/oscilador Y2 conectado ao pino de clock do U2
-        "L1": [("U1", "11"), ("U1", "12")],
-        "L2": [("U1", "11"), ("U1", "12")],
+        "Y1": [("U1", "52"), ("U1", "53")],   # XTAL_N / XTAL_P
+        "Y2": [("U2", "3")],                  # SCX (ACC_CLK_EXT) - confirme no seu esquemático
+        "F1": [("BT2", "1")],                 # pino + da bateria
+        "C1": [("U1", "1")], "L1": [("U1", "1")], "R3": [("U1", "1")],   # VDDA
+        "C3": [("U1", "3")], "L2": [("U1", "3")], "R2": [("U1", "3")],   # VDD3P3
+        "C2": [("U2", "8")],                  # VDD do LSM6DS3
+        # Antena: LNA_IN (pino 2 do U1). Só é usado se o componente não compartilhar net com o U1.
+        "R4": [("U1", "2")], "L3": [("U1", "2")], "C4": [("U1", "2")], "J1": [("U1", "2")],
     },
-
-
-    weights={
-        # Cristal do microcontrolador
-        "Y1": 35.0,
-
-        # Circuito de RF e antena (pesos altos para encurtar trilhas de 2.4 GHz)
-        "R4": 30.0,
-        "C4": 30.0,
-        "L3": 28.0,
-        "J1": 22.0,     
-
-        # Desacoplamento
-        "C1": 14.0,
-        "C2": 20.0,
-        "C3": 20.0,
-
-        # Oscilador externo e acelerômetro
-        "R1": 15.0,
-        "Y2": 14.0,
-
-        # Alimentação e filtros
-        "F1": 45.0,
-        "L1": 12.0,
-        "L2": 12.0,
-        "R2": 10.0,
-        "R3": 10.0,
-    },
+    weights={"Y1": 25.0, "Y2": 20.0, "F1": 15.0, "C1": 15.0, "C2": 15.0, "C3": 15.0,
+             "R4": 12.0, "L3": 12.0, "C4": 12.0, "J1": 4.0},
 )
 
 
 # ----------------------------------------------------------------------------
-# GEOMETRIA, TRANSFORMAÇÕES E DETECÇÃO DE COLISÕES
+# GEOMETRIA
 # ----------------------------------------------------------------------------
-# Funções matemáticas para conversão de unidades do KiCad (nanômetros -> mm),
-# rotação de coordenadas de pads/caixas e verificação de intersecções e bordas.
-
 def mm(v):
     return pcbnew.ToMM(v)
 
@@ -337,10 +274,7 @@ class Context:
     def _is_group_net(self, net):
         if not net:
             return False
-
-        return net.upper() in {
-            k.upper() for k in self.rules.group_nets
-        }
+        return net.upper() in {k.upper() for k in self.rules.group_nets}
 
     def _net_ok(self, net):
         if not net:
@@ -516,13 +450,13 @@ def local_refinement(ind, ctx):
 
 
 # ----------------------------------------------------------------------------
-# EXECUÇÃO
+# LIMPEZA DE COBRE E SERIGRAFIA
 # ----------------------------------------------------------------------------
 def clean_old_copper(board):
     """Remove trilhas, vias e formas gráficas soltas em F.Cu (mantendo o anel de GND de 1.0 mm)."""
     to_remove = []
 
-    # Remove trilhas estreitas (< 0.95 mm) e todas as vias
+    # 1. Remove trilhas estreitas (< 0.95 mm) e todas as vias
     for track in board.GetTracks():
         if isinstance(track, pcbnew.PCB_VIA):
             to_remove.append(track)
@@ -530,13 +464,14 @@ def clean_old_copper(board):
             if round(pcbnew.ToMM(track.GetWidth()), 2) < 0.95:
                 to_remove.append(track)
 
-    # Remove linhas/formas gráficas desenhadas na camada F.Cu
+    # 2. Remove linhas/formas gráficas desenhadas na camada F.Cu
     for drawing in board.GetDrawings():
         if drawing.GetLayer() == pcbnew.F_Cu:
             to_remove.append(drawing)
 
     for item in to_remove:
         board.Remove(item)
+
 
 def auto_clean_silkscreen(board, ctx):
     """Oculta valores (Value) poluídos e posiciona os designadores (Reference) alinhados ao componente sem colisão."""
@@ -550,11 +485,11 @@ def auto_clean_silkscreen(board, ctx):
     placed_labels = []
 
     for ref, fp in ctx.fps.items():
-        # Oculta o texto de Valor (ex.: "L_Small", "0.1uF", "SW_Nidec...")
+        # 1. Oculta o texto de Valor (ex.: "L_Small", "0.1uF", "SW_Nidec...")
         val_field = fp.Value()
         val_field.SetVisible(False)
 
-        # Configura o Designador (Reference: R1, C4, U1...)
+        # 2. Configura o Designador (Reference: R1, C4, U1...)
         ref_field = fp.Reference()
         ref_field.SetLayer(pcbnew.F_SilkS)
         ref_field.SetVisible(True)
@@ -614,7 +549,9 @@ def auto_clean_silkscreen(board, ctx):
         placed_labels.append((bx - lw / 2.0, by - lh / 2.0, bx + lw / 2.0, by + lh / 2.0))
 
 
-
+# ----------------------------------------------------------------------------
+# EXECUÇÃO
+# ----------------------------------------------------------------------------
 def run_ga_placement(board, pop_size=160, generations=250, seed=None, elite=2):
     clean_old_copper(board)
 
@@ -673,7 +610,9 @@ def run_ga_placement(board, pop_size=160, generations=250, seed=None, elite=2):
 
     v, c = violation_and_cost(best, ctx)
     if v > 1e-9:
-        print(f"\n[AVISO] Violação residual ({v:.3f}). Aplicando melhor solução encontrada mesmo assim...")
+        print(f"\n[FALHA] Nenhuma solução 100% válida (violação={v:.3f}). "
+              f"A placa NÃO foi alterada. Aumente pop_size/generations ou verifique o contorno Edge.Cuts.")
+        return None
 
     for ref in ctx.movable:
         x, y, ori = best[ref]
@@ -686,7 +625,7 @@ def run_ga_placement(board, pop_size=160, generations=250, seed=None, elite=2):
     if board.GetFileName():
         board.Save(board.GetFileName())
 
-    print(f"\n[SUCESSO] Posicionamento e serigrafia aplicados. Custo final = {c:.2f} | Violações = {v:.3f}")
+    print(f"\n[SUCESSO] Sem sobreposições, dentro da placa, serigrafia organizada e arquivo salvo. Custo final = {c:.2f}")
     for ref in ctx.movable:
         x, y, ori = best[ref]
         print(f"- {ref}: X={x:.2f}mm Y={y:.2f}mm rot={ori:.0f}°")

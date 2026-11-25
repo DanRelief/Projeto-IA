@@ -48,7 +48,7 @@ class BoardRules:
 
 BOARD_RULES = BoardRules(
     movable_refs=["Y1", "Y2", "F1", "C1", "C2", "C3", "R2", "R3", "L1", "L2",
-                  "R4", "L3", "C4", "J1"],
+                  "R4", "L3", "C4", "J1", "C5", "C6"],
     anchor_refs=["U1", "U2", "BT2"],    # a ordem importa: o primeiro é o mais central
     group_nets=("ANT_SIG",),
     group_weight=12.0,
@@ -61,6 +61,7 @@ BOARD_RULES = BoardRules(
         "C1": ["U1"], "C3": ["U1"], "L1": ["U1"], "L2": ["U1"],   # desacoplamento do micro
         "R2": ["U1"], "R3": ["U1"],
         "C2": ["U2"],     # desacoplamento do acelerômetro
+        "C5": ["Y2"], "C6": ["Y2"]   # desacoplamento do oscilador externo
     },
     # Usado só se a net não for encontrada na PCB (confira a numeração dos footprints):
     fallback_map={
@@ -71,9 +72,10 @@ BOARD_RULES = BoardRules(
         "C3": [("U1", "3")], "L2": [("U1", "3")], "R2": [("U1", "3")],   # VDD3P3
         "C2": [("U2", "8")],                  # VDD do LSM6DS3
         "R4": [("U1", "2")], "L3": [("U1", "2")], "C4": [("U1", "2")], "J1": [("U1", "2")],  # LNA_IN
+        "C5": [("Y2", "1")], "C6": [("Y2", "1")],  # desacoplamento do oscilador externo
     },
     weights={"Y1": 25.0, "Y2": 20.0, "F1": 15.0, "C1": 15.0, "C2": 15.0, "C3": 15.0,
-             "R4": 12.0, "L3": 12.0, "C4": 12.0, "J1": 4.0},
+             "R4": 12.0, "L3": 12.0, "C4": 12.0, "J1": 4.0, "C5": 15.0, "C6": 15.0},
 )
 
 ORIENTATIONS = (0, 90, 180, 270)

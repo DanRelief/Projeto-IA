@@ -19,7 +19,7 @@ import math
 import os
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pcbnew
 
@@ -200,6 +200,25 @@ class Part:
         return (gene[0] - ox, gene[1] - oy)
 
 
+def segment_crosses(a, b, x0, y0, x1, y1):
+    """O segmento a-b passa por dentro do retângulo? (recorte de Liang-Barsky)"""
+    (ax, ay), (bx, by) = a, b
+    if ((ax <= x0 and bx <= x0) or (ax >= x1 and bx >= x1) or
+            (ay <= y0 and by <= y0) or (ay >= y1 and by >= y1)):
+        return False
+    t0, t1 = 0.0, 1.0
+    dx, dy = bx - ax, by - ay
+    for p, q in ((-dx, ax - x0), (dx, x1 - ax), (-dy, ay - y0), (dy, y1 - ay)):
+        if p == 0:
+            if q <= 0:
+                return False
+        elif p < 0:
+            t0 = max(t0, q / p)
+        else:
+            t1 = min(t1, q / p)
+    return t0 < t1
+
+
 class Outline:
     """Contorno da placa: um ou mais laços (bordas externas e recortes internos)."""
 
@@ -224,24 +243,7 @@ class Outline:
         x0, y0 = rect[0] - margin + EPS, rect[1] - margin + EPS
         x1, y1 = rect[2] + margin - EPS, rect[3] + margin - EPS
         for (ax, ay), (bx, by) in self.segs:
-            if ((ax <= x0 and bx <= x0) or (ax >= x1 and bx >= x1) or
-                    (ay <= y0 and by <= y0) or (ay >= y1 and by >= y1)):
-                continue
-            t0, t1 = 0.0, 1.0                           # recorte de Liang-Barsky
-            dx, dy = bx - ax, by - ay
-            hit = True
-            for p, q in ((-dx, ax - x0), (dx, x1 - ax), (-dy, ay - y0), (dy, y1 - ay)):
-                if p == 0:
-                    if q <= 0:
-                        hit = False
-                        break
-                else:
-                    t = q / p
-                    if p < 0:
-                        t0 = max(t0, t)
-                    else:
-                        t1 = min(t1, t)
-            if hit and t0 < t1:
+            if segment_crosses((ax, ay), (bx, by), x0, y0, x1, y1):
                 return False
         return self.point_inside((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
 
@@ -782,6 +784,143 @@ def evolve(ctx, pop_size, generations, elite=2, verbose=True, mutation_rate=0.08
 
 
 # ----------------------------------------------------------------------------
+# ACABAMENTO OPCIONAL: limpeza de cobre antigo e organização da serigrafia
+# ----------------------------------------------------------------------------
+RING_MIN_WIDTH_MM = 0.95     # trilhas/formas a partir desta largura são preservadas (anel de GND)
+
+
+def clean_old_copper(board, min_keep_mm=RING_MIN_WIDTH_MM):
+    """Remove trilhas estreitas, todas as vias e desenhos soltos em F.Cu.
+    Preserva o anel de GND (largura >= min_keep_mm) e itens travados. Zonas não são tocadas.
+    Retorna a contagem do que foi removido."""
+    removed = {"trilhas": 0, "vias": 0, "desenhos": 0}
+    to_remove = []
+
+    def wide(item):
+        return round(mm(item.GetWidth()), 2) >= min_keep_mm
+
+    for track in list(board.GetTracks()):
+        if track.IsLocked():
+            continue
+        if isinstance(track, pcbnew.PCB_VIA):        # via vem antes: também é um PCB_TRACK
+            to_remove.append(("vias", track))
+        elif isinstance(track, pcbnew.PCB_TRACK) and not wide(track):
+            to_remove.append(("trilhas", track))
+
+    for drawing in list(board.GetDrawings()):
+        if drawing.GetLayer() != pcbnew.F_Cu or drawing.IsLocked():
+            continue
+        if isinstance(drawing, pcbnew.PCB_SHAPE) and wide(drawing):
+            continue                                 # anel desenhado como forma gráfica
+        to_remove.append(("desenhos", drawing))
+
+    for kind, item in to_remove:
+        board.Remove(item)
+        removed[kind] += 1
+    return removed
+
+
+def parts_over_wide_tracks(board, min_width_mm=RING_MIN_WIDTH_MM):
+    """Componentes cujo corpo fica em cima de uma trilha larga preservada, no mesmo lado."""
+    hits = set()
+    wide = [t for t in board.GetTracks() if not isinstance(t, pcbnew.PCB_VIA)
+            and round(mm(t.GetWidth()), 2) >= min_width_mm]
+    for fp in board.GetFootprints():
+        rect = measure_rects(fp)[1]
+        through = any(p.HasHole() for p in fp.Pads())
+        side = pcbnew.B_Cu if fp.IsFlipped() else pcbnew.F_Cu
+        for t in wide:
+            if not through and t.GetLayer() != side:
+                continue
+            half = mm(t.GetWidth()) / 2
+            a, b = t.GetStart(), t.GetEnd()
+            if segment_crosses((mm(a.x), mm(a.y)), (mm(b.x), mm(b.y)),
+                               rect[0] - half, rect[1] - half, rect[2] + half, rect[3] + half):
+                hits.add(fp.GetReference())
+    return sorted(hits)
+
+
+def set_text_angle(text, degrees):
+    if hasattr(text, "SetTextAngleDegrees"):
+        text.SetTextAngleDegrees(degrees)
+    else:
+        text.SetTextAngle(pcbnew.EDA_ANGLE(degrees, pcbnew.DEGREES_T))
+
+
+def auto_clean_silkscreen(board, rules=None):
+    """Oculta os valores (Value) e posiciona os designadores (Reference) junto ao componente.
+    Retorna as referências cujo texto ainda colide com algo (ajustar à mão)."""
+    rules = rules or BOARD_RULES
+    outline = read_outline(board)
+    fps = sorted(board.GetFootprints(), key=lambda f: f.GetReference())
+
+    # Corpos de TODOS os footprints, com margem extra; cada lado da placa tem a sua serigrafia
+    occupied, through = {}, {}
+    for fp in fps:
+        ref = fp.GetReference()
+        x0, y0, x1, y1 = measure_rects(fp)[0]
+        margin = 0.85 if (x1 - x0) > 5.0 else 0.25
+        occupied[ref] = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+        through[ref] = any(p.HasHole() for p in fp.Pads())
+
+    sides = {fp.GetReference(): bool(fp.IsFlipped()) for fp in fps}
+    placed_labels = []          # (lado, retângulo)
+    problems = []
+
+    for fp in fps:
+        ref, back = fp.GetReference(), sides[fp.GetReference()]
+        fp.Value().SetVisible(False)            # oculta "L_Small", "0.1uF" etc.
+
+        text = fp.Reference()
+        text.SetLayer(pcbnew.B_SilkS if back else pcbnew.F_SilkS)
+        text.SetMirrored(back)
+        text.SetVisible(True)
+        text.SetTextSize(pcbnew.VECTOR2I(int(pcbnew.FromMM(0.75)), int(pcbnew.FromMM(0.75))))
+        text.SetTextThickness(int(pcbnew.FromMM(0.14)))
+
+        x0, y0, x1, y1 = measure_rects(fp)[0]
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        w, h = x1 - x0, y1 - y0
+        base_w, base_h = len(ref) * 0.75, 0.90
+
+        def box(px, py, lw, lh):
+            return (px - lw / 2.0, py - lh / 2.0, px + lw / 2.0, py + lh / 2.0)
+
+        def score(px, py, lw, lh):
+            lrect = box(px, py, lw, lh)
+            total = 0.0 if outline.contains(lrect, 0.5) else 1000.0
+            for other, orect in occupied.items():
+                if other != ref and (sides[other] == back or through[other]):
+                    total += 25.0 * overlap(lrect, orect, 0.15)
+            for side, prect in placed_labels:
+                if side == back:
+                    total += 40.0 * overlap(lrect, prect, 0.20)
+            return total
+
+        # Texto alinhado com o componente (0 ou 90 graus)
+        angle = 90.0 if int(round(fp.GetOrientationDegrees())) % 180 == 90 else 0.0
+        lw, lh = (base_h, base_w) if angle == 90.0 else (base_w, base_h)
+
+        # CI grande: texto no meio do corpo, desde que não caia em cima de um pad
+        centre = box(cx, cy, base_w, base_h)
+        on_pad = any(overlap(centre, box_to_rect(p.GetBoundingBox()), 0.0) for p in fp.Pads())
+        if w > 5.0 and h > 5.0 and not on_pad:
+            angle, lw, lh = 0.0, base_w, base_h
+            candidates = [(cx, cy)]
+        else:
+            dx, dy = w / 2.0 + lw / 2.0 + 0.35, h / 2.0 + lh / 2.0 + 0.35
+            candidates = [(cx, cy - dy), (cx, cy + dy), (cx + dx, cy), (cx - dx, cy)]
+
+        bx, by = min(candidates, key=lambda c: score(c[0], c[1], lw, lh))
+        if score(bx, by, lw, lh) > 0:
+            problems.append(ref)
+        set_text_angle(text, angle)
+        text.SetPosition(pcbnew.VECTOR2I(int(pcbnew.FromMM(bx)), int(pcbnew.FromMM(by))))
+        placed_labels.append((back, box(bx, by, lw, lh)))
+    return problems
+
+
+# ----------------------------------------------------------------------------
 # APLICAÇÃO, CONFERÊNCIA E RELATÓRIO
 # ----------------------------------------------------------------------------
 def set_footprint(part, gene):
@@ -828,7 +967,7 @@ def rule_distances(ctx, genes):
 
 def run_ga_placement(board, pop_size=120, generations=300, seed=42, elite=2,
                      refine=True, apply=True, history_path=None, rules=None, verbose=True,
-                     mutation_rate=0.08):
+                     mutation_rate=0.08, clean_copper=False, tidy_silk=False):
     """Posiciona os componentes. Retorna um dicionário com o resultado (ou None se não
     for possível nem ler a placa)."""
     def log(msg):
@@ -881,10 +1020,6 @@ def run_ga_placement(board, pop_size=120, generations=300, seed=42, elite=2,
         for ref, gene in all_genes.items():
             set_footprint(ctx.parts[ref], gene)
         outside_after = check_board(ctx)
-        try:
-            pcbnew.Refresh()
-        except Exception:
-            pass
 
     pairs = find_overlaps(ctx, best)
     result = {"outside_before": ctx.outside, "outside_after": outside_after,
@@ -914,11 +1049,30 @@ def run_ga_placement(board, pop_size=120, generations=300, seed=42, elite=2,
     else:
         log("[OK] SOBREPOSIÇÃO: nenhum componente reposicionado invade outro.")
     log(f"[INFO] Custo de roteamento final = {cost:.2f}")
-    try:
-        if apply and len(board.GetTracks()) > 0:
-            log("[AVISO] A placa já tem trilhas/vias. Apague-as e roteie de novo no Freerouting.")
-    except Exception:
-        pass
+
+    result.update(removed_copper=None, silk_problems=None, over_wide_tracks=[])
+    if apply:
+        if clean_copper:
+            result["removed_copper"] = removed = clean_old_copper(board)
+            log(f"[LIMPEZA] Removidos: {removed['trilhas']} trilhas, {removed['vias']} vias, "
+                f"{removed['desenhos']} desenhos em F.Cu.")
+        if tidy_silk:
+            result["silk_problems"] = bad = auto_clean_silkscreen(board, ctx.rules)
+            log(f"[SERIGRAFIA] Organizada. Ajustar à mão: {', '.join(bad) or 'nenhum'}")
+        result["over_wide_tracks"] = over_ring = parts_over_wide_tracks(board)
+        if over_ring:
+            log(f"[AVISO] Sobre trilha larga (anel de GND?): {', '.join(over_ring)}. "
+                f"Aumente a margem de borda (--margem-borda).")
+        if any(isinstance(t, pcbnew.PCB_VIA) or mm(t.GetWidth()) < RING_MIN_WIDTH_MM
+               for t in board.GetTracks()):
+            log("[AVISO] A placa ainda tem trilhas/vias antigas. Use --limpar-cobre (ou apague-as) "
+                "e roteie de novo no Freerouting.")
+        try:
+            pcbnew.Refresh()
+        except Exception:
+            pass
+    elif clean_copper or tidy_silk:
+        log("[SIMULAÇÃO] Limpeza de cobre e serigrafia não são executadas.")
     return result
 
 
@@ -934,15 +1088,25 @@ def main(argv=None):
     ap.add_argument("--sem-refinamento", action="store_true", help="mostra o resultado só do AG")
     ap.add_argument("--simular", action="store_true", help="calcula, mas não grava a placa")
     ap.add_argument("--historico", help="grava a convergência por geração em CSV")
+    ap.add_argument("--limpar-cobre", action="store_true",
+                    help="remove trilhas < 0,95 mm, vias e desenhos em F.Cu")
+    ap.add_argument("--organizar-silk", action="store_true",
+                    help="oculta valores e reposiciona as referências")
+    ap.add_argument("--margem-borda", type=float,
+                    help="folga até a borda em mm (use para ficar dentro do anel de GND)")
     a = ap.parse_args(argv)
 
     if not os.path.isfile(a.placa):
         print(f"[ERRO] Arquivo não encontrado: {a.placa}")
         return 1
     board = pcbnew.LoadBoard(a.placa)
+    rules = BOARD_RULES
+    if a.margem_borda is not None:
+        rules = replace(BOARD_RULES, edge_margin_mm=a.margem_borda)
     res = run_ga_placement(board, a.pop, a.geracoes, a.seed, a.elite,
                            refine=not a.sem_refinamento, apply=not a.simular,
-                           history_path=a.historico, mutation_rate=a.mutacao)
+                           history_path=a.historico, mutation_rate=a.mutacao, rules=rules,
+                           clean_copper=a.limpar_cobre, tidy_silk=a.organizar_silk)
     if res is None:
         return 1
     if not a.simular:

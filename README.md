@@ -14,6 +14,8 @@ No projeto de hardware, a disposição física dos componentes impacta diretamen
 - **Proteção na Entrada de Energia:** Ancoragem do fusível de proteção (`F1`) diretamente próximo ao terminal positivo da bateria (`BT2`).
 - **Design for Manufacturing (DFM):** Garantia matemática de zero sobreposição física entre corpos/pads (com folga mínima configurável para soldagem) e respeito rigoroso ao contorno real da placa (`Edge.Cuts`).
 - **Organização Automática da Serigrafia:** Ocultação de textos de valores poluídos (`Value`) e reposicionamento automático dos designadores (`Reference`) na camada `F.Silkscreen` sem colisões.
+- **Relatório de Evolução do Algoritmo:** Registro das gerações executadas, com informações sobre cada componente e as mutações sofridas durante o processo evolutivo.
+- **Limpeza Opcional de Serigrafia e Cobre:** Disponibilização de funções para limpeza automática da serigrafia e das trilhas de cobre, permitindo que o usuário escolha quais operações deseja executar.
 
 ---
 
@@ -42,8 +44,9 @@ O script foi estruturado em módulos funcionais independentes:
    - **Operadores Genéticos:** Seleção por torneio ($k=3$), elitismo, *crossover* uniforme (50%) e mutação gaussiana com decaimento linear de passo e saltos ocasionais para escapar de ótimos locais.
 4. **Refinamento Local e Pós-Processamento:**
    - **Descida por Coordenadas (`local_refinement`):** Ajuste fino determinístico em passos decrescentes ($0.25\text{ mm}$ até $0.01\text{ mm}$) ao final das gerações.
-   - **Limpeza de Serigrafia (`auto_clean_silkscreen`):** Alinha a orientação dos textos aos componentes e escolhe posições livres ao redor de cada footprint.
-
+   - **Limpeza de Serigrafia (`tidy_silk`):** Função opcional responsável pela organização dos textos de referência na camada `F.Silkscreen`, evitando colisões e melhorando a legibilidade.
+   - **Limpeza de Cobre e Trilhas (`clean_copper`):** Função opcional que permite executar a limpeza de cobre e trilhas da placa, conforme a implementação do script.
+   - **Controle pelo Usuário:** As operações de limpeza podem ser ativadas ou desativadas individualmente durante a chamada do algoritmo, por meio de parâmetros booleanos.
 ---
 
 
@@ -64,6 +67,8 @@ Abaixo estão os principais hiperparâmetros evolutivos e restrições mecânica
 | `generations` | `250` | `run_ga_placement` | Total de gerações evolutivas executadas antes do refinamento local (*Hill Climbing*). |
 | `elite` | `2` | `run_ga_placement` | Quantidade dos melhores indivíduos preservados intactos para a geração seguinte (elitismo). |
 | `seed` | `None` | `run_ga_placement` | Semente do gerador pseudoaleatório; defina um inteiro (ex.: `42`) para obter resultados 100% reproduzíveis. |
+| `clean_copper` | `True` | `run_ga_placement` | Ativa ou desativa a limpeza de cobre e trilhas. |
+| `tidy_silk` | `True` | `run_ga_placement` | Ativa ou desativa a organização automática da serigrafia. |
 
 ---
 
@@ -112,7 +117,11 @@ importlib.reload(script_IA)
 board = pcbnew.GetBoard()
 
 # Use seed=None para busca estocástica ou fixe um inteiro (ex.: seed=42) para reprodutibilidade
-script_IA.run_ga_placement(board, pop_size=160, generations=250, seed=42)
+script_IA.run_ga_placement(
+    pcbnew.GetBoard(),
+    clean_copper=True,
+    tidy_silk=True
+)
 
 Após a conclusão no console, abra o Visualizador 3D (Alt + 3) ou execute o DRC (Inspecionar > Verificador de Regras de Projeto) para validar as folgas físicas.
 

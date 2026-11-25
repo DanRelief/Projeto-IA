@@ -1,4 +1,3 @@
-
 # Otimizador de posicionamento de PCB com Algoritmo Genético (KiCad / pcbnew)
 
 # Principais garantias desta versão:
@@ -8,6 +7,7 @@
 #   * A atração (distância) é calculada a partir dos PINOS reais, descobertos pelas NETS
 #     da própria PCB (ex.: Y1 -> pinos 52/53 do U1; C2 -> VDD do U2). O mapa manual
 #     (FALLBACK_MAP) só é usado se a net não for encontrada.
+#   * Limpeza de cobre antigo, organização automática da serigrafia e salvamento da placa.
 
 import math
 import random
@@ -40,8 +40,8 @@ class BoardRules:
 BOARD_RULES = BoardRules(
     movable_refs=["Y1", "Y2", "F1", "C1", "C2", "C3", "R2", "R3", "L1", "L2",
                   "R4", "L3", "C4", "J1"],
-    anchor_refs=["U1", "U2", "BT2"],
-    group_nets=("ANT_SIG",),
+    anchor_refs=["U1", "U2", "BT2", "SW1", "SW2"],
+    group_nets=("/ANT_SIG", "ANT_SIG"),  # Ajuste se a net na PCB tiver ou não a barra "/"
     group_weight=12.0,
     edge_weights={"J1": 30.0, "R4": 5.0, "L3": 5.0, "C4": 5.0},
     attract_to={
@@ -274,8 +274,7 @@ class Context:
     def _is_group_net(self, net):
         if not net:
             return False
-        up = net.upper()
-        return any(k.upper() in up for k in self.rules.group_nets)
+        return net.upper() in {k.upper() for k in self.rules.group_nets}
 
     def _net_ok(self, net):
         if not net:
@@ -451,9 +450,111 @@ def local_refinement(ind, ctx):
 
 
 # ----------------------------------------------------------------------------
+# LIMPEZA DE COBRE E SERIGRAFIA
+# ----------------------------------------------------------------------------
+def clean_old_copper(board):
+    """Remove trilhas, vias e formas gráficas soltas em F.Cu (mantendo o anel de GND de 1.0 mm)."""
+    to_remove = []
+
+    # 1. Remove trilhas estreitas (< 0.95 mm) e todas as vias
+    for track in board.GetTracks():
+        if isinstance(track, pcbnew.PCB_VIA):
+            to_remove.append(track)
+        elif isinstance(track, pcbnew.PCB_TRACK):
+            if round(pcbnew.ToMM(track.GetWidth()), 2) < 0.95:
+                to_remove.append(track)
+
+    # 2. Remove linhas/formas gráficas desenhadas na camada F.Cu
+    for drawing in board.GetDrawings():
+        if drawing.GetLayer() == pcbnew.F_Cu:
+            to_remove.append(drawing)
+
+    for item in to_remove:
+        board.Remove(item)
+
+
+def auto_clean_silkscreen(board, ctx):
+    """Oculta valores (Value) poluídos e posiciona os designadores (Reference) alinhados ao componente sem colisão."""
+    # Pega retângulos finais de TODOS os footprints (com margem extra)
+    occupied = []
+    for ref, fp in ctx.fps.items():
+        x0, y0, x1, y1 = get_rect(fp)
+        margin = 0.85 if (x1 - x0) > 5.0 else 0.25
+        occupied.append((ref, x0 - margin, y0 - margin, x1 + margin, y1 + margin))
+
+    placed_labels = []
+
+    for ref, fp in ctx.fps.items():
+        # 1. Oculta o texto de Valor (ex.: "L_Small", "0.1uF", "SW_Nidec...")
+        val_field = fp.Value()
+        val_field.SetVisible(False)
+
+        # 2. Configura o Designador (Reference: R1, C4, U1...)
+        ref_field = fp.Reference()
+        ref_field.SetLayer(pcbnew.F_SilkS)
+        ref_field.SetVisible(True)
+        ref_field.SetTextSize(pcbnew.VECTOR2I(pcbnew.FromMM(0.75), pcbnew.FromMM(0.75)))
+        ref_field.SetTextThickness(pcbnew.FromMM(0.14))
+
+        # Alinha o ângulo do texto com a orientação do componente (0° horizontal ou 90° vertical)
+        fp_ori = int(round(fp.GetOrientationDegrees())) % 180
+        text_angle = 90.0 if fp_ori == 90 else 0.0
+        ref_field.SetTextAngleDegrees(text_angle)
+
+        x0, y0, x1, y1 = get_rect(fp)
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        w, h = x1 - x0, y1 - y0
+
+        # Ajusta largura e altura da caixa do texto conforme o ângulo (0° ou 90°)
+        base_w, base_h = len(ref) * 0.60, 0.90
+        lw, lh = (base_h, base_w) if text_angle == 90.0 else (base_w, base_h)
+
+        # Se for CI grande (U1, BT2), centraliza o texto no meio do corpo do componente
+        if w > 5.0 and h > 5.0:
+            ref_field.SetTextAngleDegrees(0.0)
+            best_pos = (cx, cy)
+            lw, lh = base_w, base_h
+        else:
+            # Testa 4 posições ao redor do componente: cima, baixo, direita, esquerda
+            offset_y = h / 2.0 + lh / 2.0 + 0.35
+            offset_x = w / 2.0 + lw / 2.0 + 0.35
+            candidates = [
+                (cx, cy - offset_y),  # cima
+                (cx, cy + offset_y),  # baixo
+                (cx + offset_x, cy),  # direita
+                (cx - offset_x, cy),  # esquerda
+            ]
+            best_pos = candidates[0]
+            best_score = float("inf")
+
+            for px, py in candidates:
+                lrect = (px - lw / 2.0, py - lh / 2.0, px + lw / 2.0, py + lh / 2.0)
+                score = 0.0
+                # Penaliza sair da placa
+                score += 60.0 * boundary_violation(lrect, ctx.bounds, ctx.outline, 0.5)
+                # Penaliza colidir com outro componente
+                for oref, ox0, oy0, ox1, oy1 in occupied:
+                    if oref != ref:
+                        score += 25.0 * overlap_violation(lrect, (ox0, oy0, ox1, oy1), 0.15)
+                # Penaliza colidir com outro texto já posicionado
+                for prect in placed_labels:
+                    score += 40.0 * overlap_violation(lrect, prect, 0.20)
+
+                if score < best_score:
+                    best_score = score
+                    best_pos = (px, py)
+
+        bx, by = best_pos
+        ref_field.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(bx), pcbnew.FromMM(by)))
+        placed_labels.append((bx - lw / 2.0, by - lh / 2.0, bx + lw / 2.0, by + lh / 2.0))
+
+
+# ----------------------------------------------------------------------------
 # EXECUÇÃO
 # ----------------------------------------------------------------------------
 def run_ga_placement(board, pop_size=160, generations=250, seed=None, elite=2):
+    clean_old_copper(board)
+
     if seed is not None:
         random.seed(seed)
 
@@ -518,9 +619,13 @@ def run_ga_placement(board, pop_size=160, generations=250, seed=None, elite=2):
         fp = ctx.fps[ref]
         fp.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(x), pcbnew.FromMM(y)))
         fp.SetOrientationDegrees(ori)
-    pcbnew.Refresh()
 
-    print(f"\n[SUCESSO] Sem sobreposições e dentro da placa. Custo final = {c:.2f}")
+    auto_clean_silkscreen(board, ctx)
+    pcbnew.Refresh()
+    if board.GetFileName():
+        board.Save(board.GetFileName())
+
+    print(f"\n[SUCESSO] Sem sobreposições, dentro da placa, serigrafia organizada e arquivo salvo. Custo final = {c:.2f}")
     for ref in ctx.movable:
         x, y, ori = best[ref]
         print(f"- {ref}: X={x:.2f}mm Y={y:.2f}mm rot={ori:.0f}°")

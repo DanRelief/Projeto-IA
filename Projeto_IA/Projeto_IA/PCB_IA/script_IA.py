@@ -1,18 +1,3 @@
-# Otimizador de posicionamento de PCB com Algoritmo Genético (KiCad / pcbnew)
-#
-# Hierarquia de regras (da mais forte para a mais fraca):
-#   1. CONTENÇÃO  - todo footprint termina dentro do contorno Edge.Cuts. É garantida
-#                   por construção (o AG só trabalha com posições válidas) e conferida
-#                   de novo na placa real depois de mover.
-#   2. SOBREPOSIÇÃO - corpos não se invadem (folga mínima). Pesa mais que qualquer distância.
-#   3. ROTEAMENTO - cristal, desacoplamento, antena etc. perto dos pinos certos.
-#
-# A única exceção física à regra 1 é um componente MAIOR que a placa: ele é
-# centralizado e o script informa a falha de forma explícita.
-#
-# Uso no terminal (Python do KiCad):  python script_IA.py placa.kicad_pcb
-# Uso no console do KiCad:            script_IA.run_ga_placement(pcbnew.GetBoard())
-
 import argparse
 import csv
 import math
@@ -23,47 +8,43 @@ from dataclasses import dataclass, field, replace
 
 import pcbnew
 
-
-# ----------------------------------------------------------------------------
-# REGRAS DA PLACA
-# ----------------------------------------------------------------------------
 @dataclass
 class BoardRules:
-    movable_refs: list                  # componentes que o AG pode otimizar
-    anchor_refs: list                   # CIs de referência (só se movem se estiverem fora)
-    fallback_map: dict                  # {ref: [(CI, pino), ...]} usado se não houver net
-    ignore_net_keywords: tuple = ("GND",)   # nets ignoradas (terra não "atrai")
-    clearance_mm: float = 0.25          # folga mínima entre corpos
-    edge_margin_mm: float = 0.30        # folga mínima até a borda da placa
-    default_weight: float = 10.0        # peso padrão da distância
+    movable_refs: list                  # Móveis em torno dos âncoras
+    anchor_refs: list                   # Fixo usados de referência pelos âncoras
+    fallback_map: dict                  # fallback para o caso de erro de net
+    ignore_net_keywords: tuple = ("GND",)   # ignora GND
+    clearance_mm: float = 0.25          # clearence
+    edge_margin_mm: float = 0.30        # clearence da borda
+    default_weight: float = 10.0        # peso da distância
     weights: dict = field(default_factory=dict)       # peso por referência
-    init_radius_mm: float = 5.0         # raio da população inicial ao redor do alvo
-    attract_to: dict = field(default_factory=dict)    # {ref: [âncoras que o atraem]}
-    edge_weights: dict = field(default_factory=dict)  # atração pela borda da placa
-    group_nets: tuple = ()              # nets cujos componentes ficam agrupados
+    init_radius_mm: float = 5.0         # raio da população inicial ao redor do alvo (usado pela gulosa)
+    attract_to: dict = field(default_factory=dict)    # móveis atraídos pelos âncoras
+    edge_weights: dict = field(default_factory=dict)  # atração pela borda (o caso do nosso conector J1)
+    group_nets: tuple = ()              # nets cujos componentes ficam agrupados (casamento da antena)
     group_weight: float = 12.0
-    ratsnest_weight: float = 1.0        # atração fraca para quem não tem regra própria
+    ratsnest_weight: float = 1.0        # atração fraca para quem não regra
     anchor_gap_mm: float = 6.0          # espaço desejado entre CIs que precisem ser reposicionados
 
 
 BOARD_RULES = BoardRules(
     movable_refs=["Y1", "Y2", "F1", "C1", "C2", "C3", "R2", "R3", "L1", "L2",
                   "R4", "L3", "C4", "J1", "C5", "C6"],
-    anchor_refs=["U1", "U2", "BT2"],    # a ordem importa: o primeiro é o mais central
-    group_nets=("ANT_SIG",),
+    anchor_refs=["U1", "U2", "BT2"],    # a ordem é importante
+    group_nets=("ANT_SIG",),        
     group_weight=12.0,
     edge_weights={"J1": 30.0, "R4": 5.0, "L3": 5.0, "C4": 5.0},
     attract_to={
-        "R4": ["U1"], "L3": ["U1"], "C4": ["U1"], "J1": ["U1"],   # antena -> ESP32-S2
-        "Y1": ["U1"],     # cristal do micro  -> ESP32-S2
+        "R4": ["U1"], "L3": ["U1"], "C4": ["U1"], "J1": ["U1"],   # antena -> micro
+        "Y1": ["U1"],     # cristal do micro  -> micro
         "Y2": ["U2"],     # oscilador externo -> acelerômetro
-        "F1": ["BT2"],    # fusível           -> conector da bateria
+        "F1": ["BT2"],    # fusível           -> bateria
         "C1": ["U1"], "C3": ["U1"], "L1": ["U1"], "L2": ["U1"],   # desacoplamento do micro
         "R2": ["U1"], "R3": ["U1"],
         "C2": ["U2"],     # desacoplamento do acelerômetro
         "C5": ["Y2"], "C6": ["Y2"]   # desacoplamento do oscilador externo
     },
-    # Usado só se a net não for encontrada na PCB (confira a numeração dos footprints):
+    # Usado só se a net não for encontrada na PCB:
     fallback_map={
         "Y1": [("U1", "52"), ("U1", "53")],   # XTAL_N / XTAL_P
         "Y2": [("U2", "3")],                  # SCX (ACC_CLK_EXT)
@@ -79,12 +60,9 @@ BOARD_RULES = BoardRules(
 )
 
 ORIENTATIONS = (0, 90, 180, 270)
-EPS = 1e-5   # tolerância numérica em mm (10 nm)
+EPS = 1e-5   # tolerância numérica
 
 
-# ----------------------------------------------------------------------------
-# GEOMETRIA
-# ----------------------------------------------------------------------------
 def mm(v):
     return pcbnew.ToMM(v)
 
@@ -203,7 +181,6 @@ class Part:
 
 
 def segment_crosses(a, b, x0, y0, x1, y1):
-    """O segmento a-b passa por dentro do retângulo? (recorte de Liang-Barsky)"""
     (ax, ay), (bx, by) = a, b
     if ((ax <= x0 and bx <= x0) or (ax >= x1 and bx >= x1) or
             (ay <= y0 and by <= y0) or (ay >= y1 and by >= y1)):
@@ -306,9 +283,7 @@ def linspace(lo, hi, step):
     return [lo + (hi - lo) * i / n for i in range(n + 1)]
 
 
-# ----------------------------------------------------------------------------
-# CONTEXTO: quem se move, onde pode ficar e o que atrai cada um
-# ----------------------------------------------------------------------------
+
 class Context:
     def __init__(self, board, rules, rng):
         self.rules = rules
@@ -356,7 +331,6 @@ class Context:
                       for r, p in self.parts.items() if r not in placing}
         self.genes_anchor = {}
 
-    # ---------- posições válidas ----------
     def _define_fit(self, ref):
         m = self.rules.edge_margin_mm
         for core, margin in ((False, m), (False, 0.0), (True, 0.0)):
@@ -438,7 +412,6 @@ class Context:
         x, y = self.rng.choice(self.positions(ref, ori))
         return (x, y, ori)
 
-    # ---------- atrações ----------
     def _net_ok(self, net):
         return bool(net) and not any(k.upper() in net.upper() for k in self.rules.ignore_net_keywords)
 
@@ -514,9 +487,7 @@ class Context:
             print(f"[INFO] {ref} -> {'; '.join(alvos) or '(só contenção e sobreposição)'}")
 
 
-# ----------------------------------------------------------------------------
 # FITNESS  (comparação em ordem de prioridade: sobreposição, depois custo)
-# ----------------------------------------------------------------------------
 def overlap(r1, r2, clearance):
     dx = min(r1[2], r2[2]) - max(r1[0], r2[0]) + clearance
     dy = min(r1[3], r2[3]) - max(r1[1], r2[1]) + clearance
@@ -597,9 +568,7 @@ def better(a, b):
     return a[0] <= b[0] + 1e-9 and a[1] < b[1] - 1e-9
 
 
-# ----------------------------------------------------------------------------
-# CIs (âncoras) que estejam fora da placa são posicionados primeiro
-# ----------------------------------------------------------------------------
+# CIs (âncoras) foras da placa
 def place_anchors(ctx):
     placed = {r: rect for r, rect in ctx.fixed.items() if r not in ctx.movable}
     for ref in ctx.anchors_out:
@@ -623,9 +592,7 @@ def place_anchors(ctx):
         placed[ref] = ctx.fixed[ref] = ctx.parts[ref].rect(gene)
 
 
-# ----------------------------------------------------------------------------
 # OPERADORES GENÉTICOS
-# ----------------------------------------------------------------------------
 def near_target(ctx, ref):
     """Gene aleatório perto do alvo elétrico (ou em qualquer ponto válido)."""
     conns = ctx.targets[ref]
@@ -785,9 +752,7 @@ def evolve(ctx, pop_size, generations, elite=2, verbose=True, mutation_rate=0.08
         population = nxt
 
 
-# ----------------------------------------------------------------------------
 # ACABAMENTO OPCIONAL: limpeza de cobre antigo e organização da serigrafia
-# ----------------------------------------------------------------------------
 RING_MIN_WIDTH_MM = 0.95     # trilhas/formas a partir desta largura são preservadas (anel de GND)
 
 
@@ -922,9 +887,7 @@ def auto_clean_silkscreen(board, rules=None):
     return problems
 
 
-# ----------------------------------------------------------------------------
 # APLICAÇÃO, CONFERÊNCIA E RELATÓRIO
-# ----------------------------------------------------------------------------
 def set_footprint(part, gene):
     x, y = part.origin(gene)
     part.fp.SetOrientationDegrees(float(gene[2]))
@@ -1123,7 +1086,7 @@ def main(argv=None):
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         sys.exit(main())
-    board = pcbnew.GetBoard()           # executado de dentro do KiCad
+    board = pcbnew.GetBoard()           
     if board is None:
         print("Uso: python script_IA.py placa.kicad_pcb  (veja --help)")
         sys.exit(1)

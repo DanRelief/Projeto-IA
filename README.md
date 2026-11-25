@@ -1,120 +1,138 @@
-# Otimizador de Posicionamento e Roteamento de PCBs com Algoritmo Genético no KiCad
+# Otimizador de Posicionamento de Componentes em PCBs com Algoritmo Genético (KiCad)
 
-Este repositório contém uma solução automatizada desenvolvida em Python para otimização do posicionamento (*placement*) e roteamento de componentes em Placas de Circuito Impresso (PCBs). Utilizando **Algoritmos Genéticos (AG)** integrados à API nativa do **KiCad (`pcbnew`)**, o projeto visa atender a regras de negócio e boas práticas de projeto eletrônico, garantindo menor distância entre componentes críticos e prevenindo colisões físicas.
-
----
-
-## 📌 Visão Geral do Projeto
-
-No desenvolvimento de hardware, a distribuição física dos componentes afeta diretamente o desempenho eletrônico, a integridade do sinal, a facilidade de roteamento e os custos de fabricação. A automação desse processo por meio de algoritmos evolucionários reduz a necessidade de intervenção manual ostensiva, permitindo otimizar requisitos como:
-
-* **Proximidade Crítica:** Aproximação de componentes sensíveis a ruídos ou alta frequência (ex.: cristais osciladores e capacitores de desacoplamento) aos picos/pinos dos microcontroladores (MCU).
-
-
-* **Design for Manufacturing (DFM) & Colisões:** Aplicação de margens de segurança para evitar sobreposição geométrica e invasão de footprints.
-
-
-* **Roteamento Eficiente:** Otimização prévia do layout para simplificar a etapa posterior de roteamento de trilhas (*routing*) realizada por ferramentas como o *Freerouting*.
-
+Este repositório contém uma ferramenta de automação desenvolvida em Python para otimizar o posicionamento (*placement*) de componentes eletrônicos em Placas de Circuito Impresso (PCBs). Integrado diretamente à API nativa do **KiCad (`pcbnew`)**, o sistema utiliza um **Algoritmo Genético (AG)** híbrido (com busca local determinística) para distribuir componentes respeitando regras elétricas, integridade de sinal e restrições mecânicas de fabricação.
 
 
 ---
 
-## 🛠️ Tecnologias e Ferramentas Utilizadas
+## Visão Geral e Motivação
 
-* **Linguagem:** Python 3.11+.
+No projeto de hardware, a disposição física dos componentes impacta diretamente o desempenho eletromagnético, a imunidade a ruídos, a dissipação térmica e a viabilidade de soldagem. O otimizador traduz boas práticas de engenharia de PCB em restrições matemáticas e pesos de atração:
 
+- **Integridade de Sinal e RF (2.4 GHz):** Agrupamento compacto das redes de antena e casamento de impedância (`/ANT_SIG`, `Net-(J1-In)`), mantendo filtros e conectores coaxiais próximos aos pinos de RF do microcontrolador.
+- **Estabilidade de Clock e Desacoplamento:** Alta prioridade de proximidade para cristais osciladores (`Y1`, `Y2`) e capacitores de desacoplamento (`C1`–`C4`) junto aos pinos de alimentação e oscilação dos CIs.
+- **Proteção na Entrada de Energia:** Ancoragem do fusível de proteção (`F1`) diretamente próximo ao terminal positivo da bateria (`BT2`).
+- **Design for Manufacturing (DFM):** Garantia matemática de zero sobreposição física entre corpos/pads (com folga mínima configurável para soldagem) e respeito rigoroso ao contorno real da placa (`Edge.Cuts`).
+- **Organização Automática da Serigrafia:** Ocultação de textos de valores poluídos (`Value`) e reposicionamento automático dos designadores (`Reference`) na camada `F.Silkscreen` sem colisões.
+- **Relatório de Evolução do Algoritmo:** Registro das gerações executadas, com informações sobre cada componente e as mutações sofridas durante o processo evolutivo.
+- **Limpeza Opcional de Serigrafia e Cobre:** Disponibilização de funções para limpeza automática da serigrafia e das trilhas de cobre, permitindo que o usuário escolha quais operações deseja executar.
 
-* **EDAs / Suporte de Layout:** KiCad 10.0 (aplicando API `pcbnew`).
+---
 
+## Tecnologias e Dependências
 
-* **Bibliotecas Python:** `math`, `random`, `dataclasses`, `sys`, `importlib`.
+- **Linguagem:** Python 3.11+
+- **EDA / API:** KiCad (v7.0 ou superior, compatível com KiCad 8/9/10) via módulo nativo `pcbnew`
+- **Bibliotecas Padrões:** `math`, `random`, `dataclasses`
 
+---
 
-* **Roteamento de Trilhas:** Integration via arquivo `.dsn` (Specctra) com *Freerouting*.
+## Arquitetura da Solução
+
+O script foi estruturado em módulos funcionais independentes:
+
+1. **Regras de Engenharia (`BoardRules`):**
+   - Separação clara entre **componentes móveis** (`movable_refs`) e **componentes âncora fixos** (`anchor_refs`: microcontrolador `U1`, acelerômetro `U2`, suporte de bateria `BT2` e chaves `SW1`/`SW2`).
+   - Pesos individuais por componente, agrupamento mútuo por rede (`group_nets`) e atração de borda (`edge_weights`).
+2. **Extração de Contexto da PCB (`Context`):**
+   - Leitura dinâmica das coordenadas reais dos *pads* a partir das *nets* da placa (com suporte a mapa de contingência `fallback_map`).
+   - Extração do polígono real de contorno (`Edge.Cuts`) para validação geométrica.
+3. **Motor Evolutivo (Algoritmo Genético):**
+   - **Representação (Cromossomo):** Dicionário mapeando cada componente móvel para $(X, Y, \theta)$, onde $\theta \in \{0^\circ, 90^\circ, 180^\circ, 270^\circ\}$.
+   - **Inicialização Gulosa (`create_individual`):** Gera indivíduos iniciais posicionando peças sequencialmente ao redor de seus pinos-alvo sem colisões.
+   - **Função de Aptidão (*Fitness*):** Minimiza a soma ponderada das distâncias euclidianas entre pinos conectados e aplica penalidades severas ($10^4 \times \text{violação}$) para invasão de folga mínima (`clearance_mm = 0.35 mm`) ou saída da margem de borda (`edge_margin_mm = 1.50 mm`).
+   - **Operadores Genéticos:** Seleção por torneio ($k=3$), elitismo, *crossover* uniforme (50%) e mutação gaussiana com decaimento linear de passo e saltos ocasionais para escapar de ótimos locais.
+4. **Refinamento Local e Pós-Processamento:**
+   - **Descida por Coordenadas (`local_refinement`):** Ajuste fino determinístico em passos decrescentes ($0.25\text{ mm}$ até $0.01\text{ mm}$) ao final das gerações.
+   - **Limpeza de Serigrafia (`tidy_silk`):** Função opcional responsável pela organização dos textos de referência na camada `F.Silkscreen`, evitando colisões e melhorando a legibilidade.
+   - **Limpeza de Cobre e Trilhas (`clean_copper`):** Função opcional que permite executar a limpeza de cobre e trilhas da placa, conforme a implementação do script.
+   - **Controle pelo Usuário:** As operações de limpeza podem ser ativadas ou desativadas individualmente durante a chamada do algoritmo, por meio de parâmetros booleanos.
+---
 
 
 
 ---
 
-## 🧬 Arquitetura da Solução (Algoritmo Genético)
+## Parâmetros Configuráveis (`BoardRules` e Execução)
 
-O motor evolutivo foi construído do zero, implementando as fases do AG adaptadas ao espaço bidimensional da PCB:
+Abaixo estão os principais hiperparâmetros evolutivos e restrições mecânicas que controlam o comportamento do otimizador:
 
-1. **Representação (Cromossomo):** Mapeia os componentes móveis com coordenadas e rotações: $(X, Y, \text{Orientação} \in \{0^\circ, 90^\circ, 180^\circ, 270^\circ\})$.
+| Parâmetro | Valor Padrão | Local | Descrição |
+| :--- | :---: | :---: | :--- |
+| `clearance_mm` | `0.35` | `BoardRules` | Folga mínima (mm) entre corpos/pads de componentes adjacentes para garantir soldagem segura sem curtos. |
+| `edge_margin_mm` | `1.50` | `BoardRules` | Distância mínima (mm) entre qualquer componente móvel e o contorno externo (`Edge.Cuts`) da placa. |
+| `group_weight` | `28.0` | `BoardRules` | Peso de coesão aplicado a componentes que compartilham redes críticas (como linhas de RF e filtros). |
+| `init_radius_mm` | `5.0` | `BoardRules` | Raio máximo (mm) ao redor dos pinos-alvo utilizado na geração gulosa da população inicial. |
+| `pop_size` | `160` | `run_ga_placement` | Número de indivíduos (layouts candidatos) avaliados simultaneamente em cada geração. |
+| `generations` | `250` | `run_ga_placement` | Total de gerações evolutivas executadas antes do refinamento local (*Hill Climbing*). |
+| `elite` | `2` | `run_ga_placement` | Quantidade dos melhores indivíduos preservados intactos para a geração seguinte (elitismo). |
+| `seed` | `None` | `run_ga_placement` | Semente do gerador pseudoaleatório; defina um inteiro (ex.: `42`) para obter resultados 100% reproduzíveis. |
+| `clean_copper` | `True` | `run_ga_placement` | Ativa ou desativa a limpeza de cobre e trilhas. |
+| `tidy_silk` | `True` | `run_ga_placement` | Ativa ou desativa a organização automática da serigrafia. |
+
+---
+
+## Guia de Adaptação para Outras Placas
+
+Para reutilizar este otimizador em outro projeto de PCB no KiCad, basta editar a instância `BOARD_RULES` no início do script[cite: 12]:
+
+1. **Defina os componentes móveis e fixos:**
+   - Adicione em `movable_refs` os designadores de passivos, cristais, fusíveis e conectores que podem ser reposicionados (`"R1"`, `"C1"`, `"Y1"`, etc.)[cite: 12].
+   - Adicione em `anchor_refs` os circuitos integrados principais e componentes mecânicos fixos (`"U1"`, `"BT2"`, `"SW1"`, etc.)[cite: 12].
+2. **Configure as atrações e grupos críticos:**
+   - Em `attract_to`, associe cada componente móvel ao CI de referência correspondente para evitar atrações cruzadas indesejadas[cite: 12].
+   - Em `group_nets`, liste as redes que exigem alta proximidade mútua entre passivos (ex.: casamento de impedância de antena ou filtros LC)[cite: 12].
+3. **Ajuste os pesos de prioridade (`weights`):**
+   - Atribua valores maiores (ex.: `30.0` a `45.0`) para cristais osciladores, circuitos de RF e proteção de entrada, e valores intermediários (`10.0` a `20.0`) para capacitores de desacoplamento e resistores de *pull-up*[cite: 12].
+   - Caso alguma conexão não seja identificada automaticamente pelas *nets* da placa, declare o par `(CI, pino)` correspondente em `fallback_map`[cite: 12].
+
+---
 
 
-2. **População Inicial:** Gerada estocasticamente respeitando o contorno (*outline*) e limites da placa.
-
-
-3. **Função de Aptidão (*Fitness Function*):**
-* **Objetivo:** Maximizar a aptidão (minimizar custo total).
-
-
-* **Custo de Distância:** Calcula a distância euclidiana de componentes críticos ao MCU ($U1$).
-
-
-* **Penalidade de Colisão:** Aplica uma penalidade severa (ex.: $-1000.0$) caso a distância entre componentes fique abaixo da margem de segurança física (ex.: $7.5\text{ mm}$).
-
-
-
-4. **Operadores Genéticos:**
-* **Seleção:** Método de Torneio ($k=3$).
-
-
-* **Recombinação (Crossover):** *Crossover Uniforme* trocando parâmetros de coordenadas entre pais com 50% de probabilidade.
-
-
-* **Mutação:** Deslocamento estocástico nos eixos $X$ e $Y$ com alteração ocasional de rotação.
-
-
-
-## 🚀 Como Executar
+## Como Executar
 
 ### Pré-requisitos
 
-* KiCad v7 (ou superior com suporte para `pcbnew`) instalado.
+- KiCad instalado com suporte ao console de *scripting* Python (`pcbnew`).
+- Arquivo da placa (`.kicad_pcb`) devidamente atualizado com a *netlist* do esquemático e o contorno fechado na camada `Edge.Cuts`.
 
+### Execução no Console Python do KiCad
 
-* Arquivo do projeto e script salvos na máquina local (incluindo arquivos CAD da PCB e demais libs do projeto **em um mesmo diretório**).
-
-
-### Execução no Console Python Interno do KiCad
-
-1. Abra a placa no **KiCad PCB Editor**.
-
-
-2. Acesse o console interativo do Python: **Ferramentas > Console de Scripting Python**.
-
-
-3. Execute os seguintes comandos no console para rodar o algoritmo e ver as mudanças em tempo real na tela:
-
-
+1. Abra o arquivo `.kicad_pcb` no **Editor de PCB do KiCad**.
+2. Abra o console interativo em **Ferramentas > Console de Scripting Python**.
+3. Execute os comandos abaixo ajustando o caminho para a pasta do seu projeto:
 
 ```python
 import sys
+import importlib
 import pcbnew
 
-# Adicione o caminho do diretório onde o arquivo script_IA.py está localizado
+# Adicione o diretório onde o script está salvo
 sys.path.append(r"C:\Caminho\Para\Seu\Projeto")
 
-# Importa o módulo do script
 import script_IA
+importlib.reload(script_IA)
 
-# Captura a placa ativa aberta no KiCad e executa a otimização
+# Captura a placa aberta no KiCad e executa a otimização
 board = pcbnew.GetBoard()
-script_IA.run_ga_placement(board)
 
-```
+# Use seed=None para busca estocástica ou fixe um inteiro (ex.: seed=42) para reprodutibilidade
+script_IA.run_ga_placement(
+    pcbnew.GetBoard(),
+    clean_copper=True,
+    tidy_silk=True
+)
 
----
-
-## 🧪 Validação e Testes Modulares
-
-A validação da lógica do AG concentrou-se na **regra isolada do Cristal Oscilador ($Y1$) e Microcontrolador ($U1$)**:
-
-* **Objetivo:** Otimizar o posicionamento de $Y1$ para ficar o mais próximo possível de $U1$, respeitando a margem física de segurança.
+Após a conclusão no console, abra o Visualizador 3D (Alt + 3) ou execute o DRC (Inspecionar > Verificador de Regras de Projeto) para validar as folgas físicas.
 
 
-* **Resultados:** Observou-se a convergência do algoritmo ao longo das gerações (com decréscimo na distância euclidiana) e a atualização automática da tela gráfica do KiCad através do comando `pcbnew.Refresh()`.
+## Limitações Conhecidas e Boas Práticas
+
+- **Camada Única (`Top Layer` / `F.Cu`):** A versão atual otimiza apenas componentes posicionados na face superior da placa (`F.Cu`), sem realizar inversão automática (*flip*) para a camada inferior (`B.Cu`).
+- **Contorno Fechado (`Edge.Cuts`):** Para que a validação poligonal funcione corretamente, o desenho da borda da placa deve formar um polígono fechado e contínuo; caso contrário, o algoritmo utilizará apenas o retângulo envolvente (*bounding box*).
+- **Natureza Estocástica:** Por utilizar operadores probabilísticos, execuções com `seed=None` podem convergir para variações simétricas de custo equivalente. Recomenda-se testar algumas execuções e fixar o valor de `seed` assim que encontrar o layout desejado.
+- **Validação Final pelo DRC:** Embora o script garanta folgas entre caixas delimitadoras (*bounding boxes*) dos footprints, sempre execute o **Verificador de Regras de Projeto (DRC)** nativo do KiCad após a execução para validar restrições específicas de máscara de solda e serigrafia.
+
+
+
 
